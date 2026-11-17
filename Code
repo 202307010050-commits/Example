@@ -1,0 +1,334 @@
+// TaskNest - To-Do List App (SwiftUI)
+// Paste this into ContentView.swift of a new Xcode iOS App project (iOS 16+).
+
+import SwiftUI
+import Combine
+
+// MARK: - Models
+
+enum Priority: String, Codable, CaseIterable, Identifiable {
+    case high = "High"
+    case medium = "Medium"
+    case low = "Low"
+
+    var id: String { rawValue }
+
+    var order: Int {
+        switch self {
+        case .high: return 0
+        case .medium: return 1
+        case .low: return 2
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .high: return .red
+        case .medium: return .orange
+        case .low: return .green
+        }
+    }
+}
+
+enum TaskFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case pending = "Pending"
+    case done = "Done"
+
+    var id: String { rawValue }
+}
+
+struct TaskItem: Identifiable, Codable {
+    var id = UUID()
+    var title: String
+    var priority: Priority = .medium
+    var due: Date? = nil
+    var isDone: Bool = false
+}
+
+// MARK: - Store
+
+final class TaskStore: ObservableObject {
+    @Published var tasks: [TaskItem] = TaskStore.loadTasks()
+
+    private static let key = "tasknest.tasks.v1"
+
+    private static func loadTasks() -> [TaskItem] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([TaskItem].self, from: data) else {
+            return []
+        }
+        return decoded
+    }
+
+    private func save() {
+        if let data = try? JSONEncoder().encode(tasks) {
+            UserDefaults.standard.set(data, forKey: TaskStore.key)
+        }
+    }
+
+    func add(_ task: TaskItem) {
+        tasks.append(task)
+        save()
+    }
+
+    func update(_ task: TaskItem) {
+        if let index = tasks.firstIndex(where: { $0.id == task.id }) {
+            tasks[index] = task
+            save()
+        }
+    }
+
+    func toggle(_ task: TaskItem) {
+        if let index = tasks.firstIndex(where: { $0.id == task.id }) {
+            tasks[index].isDone.toggle()
+            save()
+        }
+    }
+
+    func delete(ids: [UUID]) {
+        tasks.removeAll(where: { ids.contains($0.id) })
+        save()
+    }
+
+    func clearCompleted() {
+        tasks.removeAll(where: { $0.isDone })
+        save()
+    }
+}
+
+// MARK: - Main screen
+
+struct ContentView: View {
+    @StateObject private var store = TaskStore()
+    @State private var filter: TaskFilter = .all
+    @State private var search: String = ""
+    @State private var editorTask: TaskItem? = nil
+
+    private var visibleTasks: [TaskItem] {
+        var items: [TaskItem] = store.tasks
+
+        switch filter {
+        case .all:
+            break
+        case .pending:
+            items = items.filter { !$0.isDone }
+        case .done:
+            items = items.filter { $0.isDone }
+        }
+
+        if !search.isEmpty {
+            items = items.filter { $0.title.localizedCaseInsensitiveContains(search) }
+        }
+
+        items.sort { (a: TaskItem, b: TaskItem) -> Bool in
+            if a.isDone != b.isDone { return !a.isDone }
+            if a.priority.order != b.priority.order { return a.priority.order < b.priority.order }
+            let dateA: Date = a.due ?? Date.distantFuture
+            let dateB: Date = b.due ?? Date.distantFuture
+            return dateA < dateB
+        }
+        return items
+    }
+
+    private var pendingCount: Int {
+        store.tasks.filter { !$0.isDone }.count
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Picker("Filter", selection: $filter) {
+                    ForEach(TaskFilter.allCases) { f in
+                        Text(f.rawValue).tag(f)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+
+                let items = visibleTasks
+
+                if items.isEmpty {
+                    Spacer()
+                    VStack(spacing: 8) {
+                        Image(systemName: "checkmark.seal")
+                            .font(.system(size: 48))
+                            .foregroundColor(.secondary)
+                        Text("No tasks here")
+                            .font(.headline)
+                        Text("Tap + to add a task.")
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                } else {
+                    List {
+                        ForEach(items) { task in
+                            TaskRow(task: task,
+                                    onToggle: { store.toggle(task) },
+                                    onEdit: { editorTask = task })
+                        }
+                        .onDelete { offsets in
+                            let ids = offsets.map { items[$0].id }
+                            store.delete(ids: ids)
+                        }
+                    }
+                    .listStyle(.plain)
+                }
+
+                Text("\(pendingCount) pending")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .padding(.vertical, 6)
+            }
+            .navigationTitle("TaskNest")
+            .searchable(text: $search, prompt: "Search tasks")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Menu {
+                        Button("Clear Completed", role: .destructive) {
+                            store.clearCompleted()
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        editorTask = TaskItem(title: "")
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                }
+            }
+            .sheet(item: $editorTask) { task in
+                TaskEditorView(task: task) { saved in
+                    if store.tasks.contains(where: { $0.id == saved.id }) {
+                        store.update(saved)
+                    } else {
+                        store.add(saved)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Row
+
+struct TaskRow: View {
+    let task: TaskItem
+    let onToggle: () -> Void
+    let onEdit: () -> Void
+
+    private var isOverdue: Bool {
+        guard let due = task.due, !task.isDone else { return false }
+        return due < Calendar.current.startOfDay(for: Date())
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: onToggle) {
+                Image(systemName: task.isDone ? "checkmark.circle.fill" : "circle")
+                    .font(.title2)
+                    .foregroundColor(task.isDone ? .green : .secondary)
+            }
+            .buttonStyle(.plain)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(task.title)
+                    .font(.body)
+                    .strikethrough(task.isDone)
+                    .foregroundColor(task.isDone ? .secondary : .primary)
+
+                HStack(spacing: 8) {
+                    Text(task.priority.rawValue)
+                        .font(.caption2)
+                        .bold()
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(task.priority.color.opacity(0.18))
+                        .foregroundColor(task.priority.color)
+                        .clipShape(Capsule())
+
+                    if let due = task.due {
+                        Text("Due " + due.formatted(date: .abbreviated, time: .omitted))
+                            .font(.caption)
+                            .foregroundColor(isOverdue ? .red : .secondary)
+                    }
+                }
+            }
+            Spacer()
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { onEdit() }
+    }
+}
+
+// MARK: - Add / edit screen
+
+struct TaskEditorView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: TaskItem
+    @State private var hasDue: Bool
+    @State private var dueDate: Date
+    let onSave: (TaskItem) -> Void
+
+    init(task: TaskItem, onSave: @escaping (TaskItem) -> Void) {
+        _draft = State(initialValue: task)
+        _hasDue = State(initialValue: task.due != nil)
+        _dueDate = State(initialValue: task.due ?? Date())
+        self.onSave = onSave
+    }
+
+    private var canSave: Bool {
+        !draft.title.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Task") {
+                    TextField("What needs to be done?", text: $draft.title)
+                }
+                Section("Priority") {
+                    Picker("Priority", selection: $draft.priority) {
+                        ForEach(Priority.allCases) { p in
+                            Text(p.rawValue).tag(p)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                Section("Due date") {
+                    Toggle("Set a due date", isOn: $hasDue)
+                    if hasDue {
+                        DatePicker("Due", selection: $dueDate, displayedComponents: .date)
+                    }
+                }
+            }
+            .navigationTitle(draft.title.isEmpty ? "New Task" : "Edit Task")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        var result = draft
+                        result.title = draft.title.trimmingCharacters(in: .whitespaces)
+                        result.due = hasDue ? dueDate : nil
+                        onSave(result)
+                        dismiss()
+                    }
+                    .disabled(!canSave)
+                }
+            }
+        }
+    }
+}
+
+struct ContentView_Previews: PreviewProvider {
+    static var previews: some View {
+        ContentView()
+    }
+}
